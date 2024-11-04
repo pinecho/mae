@@ -37,7 +37,7 @@ class MaskedAutoencoderViT(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim), requires_grad=False)  # fixed sin-cos embedding
 
         self.blocks = nn.ModuleList([
-            Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True, qk_scale=None, norm_layer=norm_layer)
+            Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
         # --------------------------------------------------------------------------
@@ -51,7 +51,7 @@ class MaskedAutoencoderViT(nn.Module):
         self.decoder_pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, decoder_embed_dim), requires_grad=False)  # fixed sin-cos embedding
 
         self.decoder_blocks = nn.ModuleList([
-            Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, qk_scale=None, norm_layer=norm_layer)
+            Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
             for i in range(decoder_depth)])
 
         self.decoder_norm = norm_layer(decoder_embed_dim)
@@ -138,6 +138,50 @@ class MaskedAutoencoderViT(nn.Module):
         # keep the first subset
         ids_keep = ids_shuffle[:, :len_keep]
         x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+        # generate the binary mask: 0 is keep, 1 is remove
+        mask = torch.ones([N, L], device=x.device)
+        
+        # unshuffle to get the binary mask
+        mask = torch.gather(mask, dim=1, index=ids_restore)
+        return x_masked, mask, ids_restore
+
+    def fixed_topN_masking(self, x, vis_indices=[],):
+        '''
+        perform a fixed masking
+        x: [N, L, D], sequence
+
+        vis_indices: [N, k], a 2d list of index k of the visible patch 
+
+        add_corner: deprecated, the corner ids should be added outside.
+        '''
+        N, L, D = x.shape # batch, length, dim   
+        id_ls = list()
+        for vis_i in vis_indices:
+            remove = set(range(L)) - set(vis_i)
+            ids = vis_i + list(remove)  
+            id_ls.append(ids)
+        ids_ = torch.tensor(id_ls)
+
+        len_vis = len(vis_i)
+        ids_restore = torch.argsort(ids_, dim=1)
+        ids_keep = ids_[:, :len_vis]
+        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1,1,D))
+
+        mask = torch.ones([N, L], device=x.device)
+        for idx, mk in enumerate(mask):
+            mk[vis_indices[idx]] = 0
+        return x_masked, mask, ids_restore 
+
+
+    def black_masking(self, x, all_index):
+        nonblack_index, black_index = all_index
+        N, L, D = x.shape  # batch, length, dim
+        len_keep = len(nonblack_index)
+        ids_keep = torch.tensor(nonblack_index).unsqueeze(0)
+        idx = torch.tensor(nonblack_index+black_index).unsqueeze(0)
+        ids_restore = torch.argsort(idx, dim=1) #was ids_shuffle
+
+        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
 
         # generate the binary mask: 0 is keep, 1 is remove
         mask = torch.ones([N, L], device=x.device)
@@ -147,17 +191,8 @@ class MaskedAutoencoderViT(nn.Module):
 
         return x_masked, mask, ids_restore
 
-    def forward_encoder(self, x, mask_ratio):
-        # embed patches
-        x = self.patch_embed(x)
+    def forward_encoder(self, x):
 
-        # add pos embed w/o cls token
-        x = x + self.pos_embed[:, 1:, :]
-
-        # masking: length -> length * mask_ratio
-        x, mask, ids_restore = self.random_masking(x, mask_ratio)
-
-        # append cls token
         cls_token = self.cls_token + self.pos_embed[:, :1, :]
         cls_tokens = cls_token.expand(x.shape[0], -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
@@ -167,7 +202,7 @@ class MaskedAutoencoderViT(nn.Module):
             x = blk(x)
         x = self.norm(x)
 
-        return x, mask, ids_restore
+        return x
 
     def forward_decoder(self, x, ids_restore):
         # embed tokens
@@ -213,8 +248,36 @@ class MaskedAutoencoderViT(nn.Module):
         loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
         return loss
 
-    def forward(self, imgs, mask_ratio=0.75):
-        latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio)
+    def forward(self, imgs, mask_ratio=0.75, vis_indices=[], mask=None):
+        '''
+        if mask_ratio:
+            >0: we use self.random_masking to generate random mask
+            ==0: we use the provided vis_indices to generate specific mask, for visualization
+            <0: the mask must be provided, and must be 2d shape of [N, k**2] or 3d shape of [N, k, k]
+            Note: vis_indices must be 2d list, each item has the same length, and each item is responsible for each batch
+        '''
+        #imgs here are normalized by the ImageNet mean/std
+        # embed patches
+        x = self.patch_embed(imgs)
+        # add pos embed w/o cls token
+        x = x + self.pos_embed[:, 1:, :]
+        # masking: length -> length * mask_ratio
+        
+        if mask_ratio > 0:
+            x_masked, mask, ids_restore = self.random_masking(x, mask_ratio=mask_ratio)
+        elif mask_ratio == 0:  
+            #Note, for single image, the vis_indices should be a 2d list, like [[3,4,5,...]]
+            x_masked, mask, ids_restore = self.fixed_topN_masking(x, vis_indices=vis_indices)
+        else: #we use the provided mask to find the vis_indices
+            assert mask is not None
+            mask = mask.flatten(1) #0 is keep, 1 is remove
+            vis_ls = list()
+            for mk in mask:
+                vis = torch.nonzero(mk==0)[:,0].tolist()
+                vis_ls.append(vis)
+            x_masked, mask, ids_restore = self.fixed_topN_masking(x, vis_indices=vis_ls)
+
+        latent = self.forward_encoder(x_masked)
         pred = self.forward_decoder(latent, ids_restore)  # [N, L, p*p*3]
         loss = self.forward_loss(imgs, pred, mask)
         return loss, pred, mask
@@ -248,3 +311,9 @@ def mae_vit_huge_patch14_dec512d8b(**kwargs):
 mae_vit_base_patch16 = mae_vit_base_patch16_dec512d8b  # decoder: 512 dim, 8 blocks
 mae_vit_large_patch16 = mae_vit_large_patch16_dec512d8b  # decoder: 512 dim, 8 blocks
 mae_vit_huge_patch14 = mae_vit_huge_patch14_dec512d8b  # decoder: 512 dim, 8 blocks
+
+if __name__ == "__main__":
+    model = mae_vit_large_patch16_dec512d8b()
+    x=torch.randn(1,3,224,224)
+    import ipdb; ipdb.set_trace()
+    y = model(x, random=0)
