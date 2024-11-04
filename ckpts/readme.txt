@@ -1,0 +1,11 @@
+Pleae make sure this directory contains following files:
+- mae_pretrain_vit_base_full.pth  
+- mae_pretrain_vit_huge_full.pth  
+- mae_pretrain_vit_large_full.pth  
+- mae_visualize_vit_base.pth  
+- mae_visualize_vit_large_ganloss.pth
+- mae_pretrain_vit_base.pth       
+- mae_pretrain_vit_huge.pth       
+- mae_pretrain_vit_large.pth      
+- mae_visualize_vit_huge.pth  
+- mae_visualize_vit_large.pth
